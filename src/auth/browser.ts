@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { chromium, type Browser, type BrowserContext, type Page } from 'playwright';
+import axios from 'axios'; // обязательно установить: npm install axios
 import type { Env } from '../config/env.js';
 import type pino from 'pino';
 
@@ -193,17 +194,131 @@ export async function runManualSessionBootstrap(env: Env, logger: pino.Logger): 
   }
 }
 
-export async function detectSiteOrChallenge(page: Page, siteUrl: string): Promise<'ok' | 'challenge' | 'down'> {
+/**
+ * Решает Cloudflare Turnstile через CapSolver.
+ * Возвращает true, если капча успешно решена и страница готова к работе.
+ */
+async function solveCloudflareCaptcha(
+  page: Page,
+  apiKey: string,
+  logger: pino.Logger,
+  env: Env
+): Promise<boolean> {
+  try {
+    // Извлекаем sitekey (чаще всего в data-sitekey или глобальной переменной)
+    const sitekey = await page.evaluate(() => {
+      const el = document.querySelector('[data-sitekey]');
+      if (el) return el.getAttribute('data-sitekey');
+      // Некоторые сайты хранят в window.turnstile
+      return (window as any).turnstile?.sitekey || null;
+    }).catch(() => null);
+
+    if (!sitekey) {
+      logger.warn('Sitekey not found, cannot solve captcha');
+      return false;
+    }
+
+    const url = page.url();
+    logger.info({ sitekey, url }, 'Attempting to solve Cloudflare Turnstile via CapSolver');
+
+    // Создаём задание в CapSolver
+    const createRes = await axios.post('https://api.capsolver.com/createTask', {
+      clientKey: apiKey,
+      task: {
+        type: 'AntiTurnstileTaskProxyLess', // для Turnstile без прокси
+        websiteURL: url,
+        websiteKey: sitekey,
+      },
+    });
+
+    const taskId = createRes.data.taskId;
+    if (!taskId) {
+      logger.error('Failed to create captcha task');
+      return false;
+    }
+
+    // Ждём решения (опрос каждые 2 секунды, до 60 секунд)
+    let solved = false;
+    let token = '';
+    for (let i = 0; i < 30; i++) {
+      await new Promise((r) => setTimeout(r, 2000));
+      const getRes = await axios.post('https://api.capsolver.com/getTaskResult', {
+        clientKey: apiKey,
+        taskId,
+      });
+      if (getRes.data.status === 'ready') {
+        token = getRes.data.solution.token;
+        solved = true;
+        break;
+      }
+    }
+
+    if (!solved) {
+      logger.error('Captcha solving timeout');
+      return false;
+    }
+
+    // Вставляем токен в страницу
+    await page.evaluate((t) => {
+      // Для Turnstile обычно есть скрытое поле cf-turnstile-response
+      const input = document.querySelector('input[name="cf-turnstile-response"]');
+      if (input) input.setAttribute('value', t);
+
+      // Если есть глобальный callback
+      if ((window as any).turnstileCallback) (window as any).turnstileCallback(t);
+    }, token);
+
+    // Часто после вставки нужно нажать кнопку подтверждения
+    await page.click('button[type="submit"]').catch(() => {});
+
+    // Ждём исчезновения капчи
+    await page
+      .waitForSelector('#cf-challenge-runner, iframe[src*="challenges"]', {
+        state: 'hidden',
+        timeout: 10000,
+      })
+      .catch(() => {});
+
+    logger.info('Captcha solved successfully');
+    return true;
+  } catch (err) {
+    logger.error({ err }, 'Error solving captcha via CapSolver');
+    return false;
+  }
+}
+
+/**
+ * Проверяет состояние сайта, автоматически решая капчу при обнаружении.
+ */
+export async function detectSiteOrChallenge(
+  page: Page,
+  siteUrl: string,
+  env: Env,
+  logger: pino.Logger
+): Promise<'ok' | 'challenge' | 'down'> {
   try {
     const response = await page.goto(siteUrl, { waitUntil: 'domcontentloaded' });
     if (!response) return 'down';
     const status = response.status();
 
-    if (await isChallengePresent(page)) return 'challenge';
+    if (await isChallengePresent(page)) {
+      if (env.CAPTCHA_API_KEY) {
+        const solved = await solveCloudflareCaptcha(page, env.CAPTCHA_API_KEY, logger, env);
+        if (solved) {
+          // После успешного решения проверяем ещё раз
+          if (await isChallengePresent(page)) return 'challenge';
+          return 'ok';
+        }
+      } else {
+        logger.warn('CAPTCHA_API_KEY not set, cannot solve challenge automatically');
+      }
+      return 'challenge';
+    }
 
     if (status >= 500 || status === 429 || status === 403) return 'down';
     return 'ok';
-  } catch {
+  } catch (error) {
+    logger.error({ error }, 'detectSiteOrChallenge failed');
     return 'down';
   }
 }
@@ -217,7 +332,12 @@ export async function ensureAuthenticated(
 
   if (await isChallengePresent(page)) {
     logger.warn({ status: 'challenge_detected' }, 'Challenge page detected before auth check');
-    return 'challenge';
+    if (env.CAPTCHA_API_KEY) {
+      const solved = await solveCloudflareCaptcha(page, env.CAPTCHA_API_KEY, logger, env);
+      if (!solved) return 'challenge';
+    } else {
+      return 'challenge';
+    }
   }
 
   const looksLoggedIn = await page.locator(AUTH_MARKER_SELECTOR).first().isVisible().catch(() => false);
