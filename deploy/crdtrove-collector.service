@@ -1,0 +1,19 @@
+[Unit]
+Description=CRDTrove Collector Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/crdtrove-collector
+EnvironmentFile=/opt/crdtrove-collector/.env
+ExecStart=/usr/bin/node dist/index.js
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+User=collector
+Group=collector
+
+[Install]
+WantedBy=multi-user.target
