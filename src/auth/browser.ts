@@ -195,6 +195,7 @@ export async function runManualSessionBootstrap(env: Env, logger: pino.Logger): 
 }
 
 /**
+/**
  * Решает Cloudflare капчу через CapSolver.
  * Автоматически определяет тип капчи и использует соответствующий тип задачи.
  * Возвращает true, если капча успешно решена.
@@ -242,12 +243,43 @@ async function solveCloudflareCaptcha(
       };
     } else {
       // Иначе пробуем универсальную Cloudflare задачу
-      taskPayload = {
-        type: 'AntiCloudflareTask',
-        websiteURL: url,
-        // При необходимости можно указать метаданные:
-        // metadata: { type: 'challenge' } 
-      };
+      // Для AntiCloudflareTask требуется прокси; если они есть — используем, иначе пробуем proxyless (может не работать)
+      if (env.PROXY_SERVER && env.PROXY_SERVER.trim() !== '') {
+        try {
+          // Парсим прокси
+          let proxyUrl = env.PROXY_SERVER;
+          if (!proxyUrl.startsWith('http://') && !proxyUrl.startsWith('https://')) {
+            proxyUrl = 'http://' + proxyUrl;
+          }
+          const parsed = new URL(proxyUrl);
+          const proxyPort = parseInt(parsed.port) || (parsed.protocol === 'https:' ? 443 : 80);
+          
+          taskPayload = {
+            type: 'AntiCloudflareTask',
+            websiteURL: url,
+            proxy: {
+              proxyType: 'http',
+              proxyAddress: parsed.hostname,
+              proxyPort: proxyPort,
+              proxyLogin: env.PROXY_USERNAME || '',
+              proxyPassword: env.PROXY_PASSWORD || '',
+            }
+          };
+          logger.info({ proxyAddress: parsed.hostname, proxyPort }, 'Using proxy for AntiCloudflareTask');
+        } catch (e) {
+          logger.warn({ err: e, proxyServer: env.PROXY_SERVER }, 'Failed to parse proxy for captcha task, falling back to proxyless');
+          taskPayload = {
+            type: 'AntiCloudflareTaskProxyLess',
+            websiteURL: url,
+          };
+        }
+      } else {
+        logger.warn('No proxy configured for AntiCloudflareTask, attempting proxyless mode (may fail)');
+        taskPayload = {
+          type: 'AntiCloudflareTaskProxyLess',
+          websiteURL: url,
+        };
+      }
     }
 
     // --- Создаём задание в CapSolver ---
@@ -294,7 +326,7 @@ async function solveCloudflareCaptcha(
         if (input) input.setAttribute('value', t);
         if ((window as any).turnstileCallback) (window as any).turnstileCallback(t);
       }, token);
-    } else if (taskPayload.type === 'AntiCloudflareTask') {
+    } else if (taskPayload.type === 'AntiCloudflareTask' || taskPayload.type === 'AntiCloudflareTaskProxyLess') {
       // AntiCloudflareTask возвращает cookies для подстановки
       if (solution.cookies) {
         await page.context().addCookies(solution.cookies.map((c: any) => ({
@@ -330,6 +362,7 @@ async function solveCloudflareCaptcha(
     return false;
   }
 }
+
 
 /**
  * Проверяет состояние сайта, автоматически решая капчу при обнаружении.
