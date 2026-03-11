@@ -52,7 +52,7 @@ export async function runCollector(
 
   while (running) {
     try {
-      const siteState = await detectSiteOrChallenge(session.page, env.SITE_URL);
+      const siteState = await detectSiteOrChallenge(session.page, env.SITE_URL, env, logger);
       if (siteState === 'challenge') {
         setState('challenge_detected');
         logger.warn({ status: state.status }, 'Challenge detected; waiting for manual intervention');
