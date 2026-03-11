@@ -195,8 +195,9 @@ export async function runManualSessionBootstrap(env: Env, logger: pino.Logger): 
 }
 
 /**
- * Решает Cloudflare Turnstile через CapSolver.
- * Возвращает true, если капча успешно решена и страница готова к работе.
+ * Решает Cloudflare капчу через CapSolver.
+ * Автоматически определяет тип капчи и использует соответствующий тип задачи.
+ * Возвращает true, если капча успешно решена.
  */
 async function solveCloudflareCaptcha(
   page: Page,
@@ -205,41 +206,67 @@ async function solveCloudflareCaptcha(
   env: Env
 ): Promise<boolean> {
   try {
-    // Извлекаем sitekey (чаще всего в data-sitekey или глобальной переменной)
+    // --- Расширенный поиск sitekey (для Turnstile) ---
     const sitekey = await page.evaluate(() => {
+      // 1. По data-sitekey
       const el = document.querySelector('[data-sitekey]');
       if (el) return el.getAttribute('data-sitekey');
-      // Некоторые сайты хранят в window.turnstile
-      return (window as any).turnstile?.sitekey || null;
+      
+      // 2. Глобальные переменные turnstile
+      if ((window as any).turnstile?.sitekey) return (window as any).turnstile.sitekey;
+      
+      // 3. Переменные _cf
+      if ((window as any)._cf?.turnstile?.sitekey) return (window as any)._cf.turnstile.sitekey;
+      
+      // 4. Поиск в скриптах (регулярное выражение)
+      const scripts = document.querySelectorAll('script');
+      for (const script of scripts) {
+        const content = script.innerHTML;
+        const match = content.match(/sitekey["']?\s*:\s*["']([^"']+)/);
+        if (match) return match[1];
+      }
+      return null;
     }).catch(() => null);
 
-    if (!sitekey) {
-      logger.warn('Sitekey not found, cannot solve captcha');
-      return false;
-    }
-
     const url = page.url();
-    logger.info({ sitekey, url }, 'Attempting to solve Cloudflare Turnstile via CapSolver');
+    logger.info({ sitekey, url }, 'Attempting to solve Cloudflare challenge via CapSolver');
 
-    // Создаём задание в CapSolver
-    const createRes = await axios.post('https://api.capsolver.com/createTask', {
-      clientKey: apiKey,
-      task: {
-        type: 'AntiTurnstileTaskProxyLess', // для Turnstile без прокси
+    // --- Определяем тип задачи ---
+    let taskPayload: any;
+    if (sitekey) {
+      // Если нашли sitekey — используем Turnstile
+      taskPayload = {
+        type: 'AntiTurnstileTaskProxyLess',
         websiteURL: url,
         websiteKey: sitekey,
-      },
+      };
+    } else {
+      // Иначе пробуем универсальную Cloudflare задачу
+      taskPayload = {
+        type: 'AntiCloudflareTask',
+        websiteURL: url,
+        // При необходимости можно указать метаданные:
+        // metadata: { type: 'challenge' } 
+      };
+    }
+
+    // --- Создаём задание в CapSolver ---
+    const createRes = await axios.post('https://api.capsolver.com/createTask', {
+      clientKey: apiKey,
+      task: taskPayload,
     });
 
     const taskId = createRes.data.taskId;
     if (!taskId) {
-      logger.error('Failed to create captcha task');
+      logger.error({ response: createRes.data }, 'Failed to create captcha task');
       return false;
     }
 
-    // Ждём решения (опрос каждые 2 секунды, до 60 секунд)
+    logger.info({ taskId, taskType: taskPayload.type }, 'Captcha task created');
+
+    // --- Ожидаем решения (опрос каждые 2 сек, до 60 сек) ---
     let solved = false;
-    let token = '';
+    let solution: any = null;
     for (let i = 0; i < 30; i++) {
       await new Promise((r) => setTimeout(r, 2000));
       const getRes = await axios.post('https://api.capsolver.com/getTaskResult', {
@@ -247,7 +274,7 @@ async function solveCloudflareCaptcha(
         taskId,
       });
       if (getRes.data.status === 'ready') {
-        token = getRes.data.solution.token;
+        solution = getRes.data.solution;
         solved = true;
         break;
       }
@@ -258,22 +285,39 @@ async function solveCloudflareCaptcha(
       return false;
     }
 
-    // Вставляем токен в страницу
-    await page.evaluate((t) => {
-      // Для Turnstile обычно есть скрытое поле cf-turnstile-response
-      const input = document.querySelector('input[name="cf-turnstile-response"]');
-      if (input) input.setAttribute('value', t);
+    // --- Применяем решение в зависимости от типа задачи ---
+    if (taskPayload.type === 'AntiTurnstileTaskProxyLess') {
+      // Вставляем токен Turnstile
+      const token = solution.token;
+      await page.evaluate((t) => {
+        const input = document.querySelector('input[name="cf-turnstile-response"]');
+        if (input) input.setAttribute('value', t);
+        if ((window as any).turnstileCallback) (window as any).turnstileCallback(t);
+      }, token);
+    } else if (taskPayload.type === 'AntiCloudflareTask') {
+      // AntiCloudflareTask возвращает cookies для подстановки
+      if (solution.cookies) {
+        await page.context().addCookies(solution.cookies.map((c: any) => ({
+          name: c.name,
+          value: c.value,
+          domain: c.domain,
+          path: c.path,
+          expires: c.expires,
+          httpOnly: c.httpOnly,
+          secure: c.secure,
+          sameSite: c.sameSite,
+        })));
+      }
+      // Перезагружаем страницу, чтобы cookies применились
+      await page.reload({ waitUntil: 'domcontentloaded' });
+    }
 
-      // Если есть глобальный callback
-      if ((window as any).turnstileCallback) (window as any).turnstileCallback(t);
-    }, token);
-
-    // Часто после вставки нужно нажать кнопку подтверждения
+    // Пытаемся нажать кнопку подтверждения, если она есть
     await page.click('button[type="submit"]').catch(() => {});
 
     // Ждём исчезновения капчи
     await page
-      .waitForSelector('#cf-challenge-runner, iframe[src*="challenges"]', {
+      .waitForSelector('#cf-challenge-runner, iframe[src*="challenges"], [data-sitekey]', {
         state: 'hidden',
         timeout: 10000,
       })
